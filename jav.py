@@ -2,10 +2,10 @@
 """
 jav - AV 元数据刮削工具
 用法:
-  jav -n JUL-999          # 刮削单个番号
-  jav -n jul999            # 自动修正格式 -> JUL-999
-  jav -n "SONE-290 SSIS-706"  # 多个番号(空格分隔)
-  jav -n SONE-290 -o /tmp/out # 自定义输出目录
+  python jav.py -n JUL-999          # 刮削单个番号
+  python jav.py -n jul999            # 自动修正格式 -> JUL-999
+  python jav.py -n "SONE-290 SSIS-706"  # 多个番号(空格分隔)
+  python jav.py -n SONE-290 -o /tmp/out # 自定义输出目录
 
 输出到 ~/javoutput/{番号}/ :
   movie.nfo, poster.jpg, fanart.jpg, .actors/{name}.jpg
@@ -16,9 +16,10 @@ import re
 import sys
 import json
 import time
-import base64
+import shutil
 import argparse
 import logging
+import xml.etree.ElementTree as ET
 from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -26,8 +27,6 @@ log = logging.getLogger('jav')
 
 # ─── 默认配置 ───
 DEFAULT_OUTPUT = os.path.expanduser("~/javoutput")
-EMBY_HOST = ""          # 例: http://192.168.1.100:8096
-EMBY_API_KEY = ""       # Emby API Key，留空则不触发刷新/上传
 SCRAPE_DELAY = 2
 
 # ─── curl_cffi session (反爬虫) ───
@@ -77,7 +76,7 @@ def get_gfriends():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  番号解析 (参考 Movie_Data_Capture number_parser)
+#  番号解析
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def normalize_number(raw):
@@ -94,33 +93,26 @@ def normalize_number(raw):
     if not s:
         return None
 
-    # 已经有横杠的，基本保持原样，转大写
-    # FC2-PPV-xxx
     fc2 = re.match(r'(?i)(fc2-?ppv)-?(\d+)', s)
     if fc2:
         return f"FC2-PPV-{fc2.group(2)}"
 
-    # 无码格式: 123456-789 或 123456_789
     unc = re.match(r'^(\d{6})[-_](\d{2,3})$', s)
     if unc:
         return f"{unc.group(1)}-{unc.group(2)}"
 
-    # n1234 (Tokyo Hot 等)
     th = re.match(r'(?i)^(n)(\d{4})$', s)
     if th:
         return f"n{th.group(2)}"
 
-    # 数字前缀: 259LUXU-1234
     npre = re.match(r'(?i)^(\d+[a-z]+)-?(\d{3,5})$', s)
     if npre:
         return f"{npre.group(1).upper()}-{npre.group(2)}"
 
-    # 标准格式: 字母-数字, 可能缺横杠
     std = re.match(r'(?i)^([a-z]{2,10})-?(\d{3,5})$', s)
     if std:
         return f"{std.group(1).upper()}-{std.group(2)}"
 
-    # 无法识别，原样大写返回
     return s.upper()
 
 
@@ -142,7 +134,6 @@ def scrape_javdb(number):
     """刮削 JavDB 获取完整元数据"""
     s = get_session()
 
-    # 搜索
     url = f"https://javdb.com/search?q={quote(number)}&f=all"
     resp = s.get(url, timeout=15)
     if resp.status_code == 403:
@@ -153,13 +144,12 @@ def scrape_javdb(number):
         log.error(f"  [JavDB] 搜索失败 HTTP {resp.status_code}")
         return None
 
-    # 找匹配的影片 — 精确匹配 video-title 区域
+    # 精确匹配 video-title 区域
     items = re.findall(
         r'<a[^>]*href="(/v/[^"]+)"[^>]*>.*?<div class="video-title">\s*<strong>\s*([^<]+?)\s*</strong>',
         resp.text, re.DOTALL
     )
     if not items:
-        # 备选: 宽松匹配
         items = re.findall(
             r'<a[^>]*href="(/v/[^"]+)"[^>]*>.*?<strong>([^<]+)</strong>',
             resp.text, re.DOTALL
@@ -180,7 +170,6 @@ def scrape_javdb(number):
 
     time.sleep(1)
 
-    # 详情页
     detail_url = f"https://javdb.com{detail_path}"
     resp = s.get(detail_url, timeout=15)
     if resp.status_code != 200:
@@ -190,7 +179,7 @@ def scrape_javdb(number):
     html = resp.text
     info = {'number': number}
 
-    # 标题: <strong class="current-title">xxx</strong>
+    # 标题
     m = re.search(r'<strong class="current-title">([^<]+)</strong>', html)
     if m:
         info['title'] = m.group(1).strip()
@@ -198,7 +187,6 @@ def scrape_javdb(number):
         m = re.search(r'<title>([^|<]+)', html)
         if m:
             t = m.group(1).strip()
-            # 去掉开头的番号
             t = re.sub(r'^' + re.escape(number) + r'\s*', '', t).strip()
             info['title'] = t
 
@@ -210,13 +198,13 @@ def scrape_javdb(number):
             cover = 'https:' + cover
         info['cover'] = cover
 
-    # 解析 panel-block (单层 </div> 闭合)
+    # 解析 panel-block
     panels = re.findall(r'<div class="panel-block[^"]*">(.*?)</div>', html, re.DOTALL)
     for panel in panels:
         clean = re.sub(r'<[^>]+>', ' ', panel)
 
         if re.search(r'番號', panel):
-            continue  # 跳过番号行
+            continue
 
         elif re.search(r'日期', panel):
             dm = re.search(r'(\d{4}-\d{2}-\d{2})', panel)
@@ -254,12 +242,10 @@ def scrape_javdb(number):
             info['genres'] = [t.strip() for t in tags if t.strip()]
 
         elif re.search(r'演員', panel):
-            # 优先取女演员 (有♀标记的)
             actors = re.findall(r'<a[^>]*href="/actors/([^"]+)"[^>]*>\s*([^<]+)</a>\s*<strong class="symbol female"', panel, re.DOTALL)
             if actors:
                 info['actors'] = [{'id': aid, 'name': aname.strip()} for aid, aname in actors]
             else:
-                # 取所有演员链接
                 actors2 = re.findall(r'<a[^>]*href="/actors/([^"]+)"[^>]*>\s*([^<]+)</a>', panel, re.DOTALL)
                 all_actors = [{'id': aid, 'name': aname.strip()} for aid, aname in actors2 if aname.strip() not in ('想看', '')]
                 if all_actors:
@@ -330,7 +316,6 @@ def download_actor_photo(name, dest):
     idx = get_gfriends()
     s = get_session()
 
-    # 尝试各种名字变体
     search_names = [name]
     clean = re.sub(r'[（(][^）)]*[）)]', '', name).strip()
     if clean != name:
@@ -356,12 +341,11 @@ def download_actor_photo(name, dest):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  NFO 生成 (Emby 兼容, 不写远程 thumb URL)
+#  NFO 生成
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def write_nfo(info, path):
     """生成 movie.nfo"""
-    import xml.etree.ElementTree as ET
     movie = ET.Element('movie')
 
     def add(tag, text):
@@ -414,48 +398,6 @@ def write_nfo(info, path):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Emby API (可选)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def emby_upload_actor(name, img_data):
-    """上传演员头像到 Emby"""
-    if not EMBY_API_KEY:
-        return
-    try:
-        import urllib.request
-        url = f"{EMBY_HOST}/emby/Persons?api_key={EMBY_API_KEY}"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        pid = None
-        for p in data.get('Items', []):
-            if p['Name'] == name:
-                pid = p['Id']
-                break
-        if not pid:
-            return
-        b64 = base64.b64encode(img_data)
-        up_url = f"{EMBY_HOST}/emby/Items/{pid}/Images/Primary?api_key={EMBY_API_KEY}"
-        req = urllib.request.Request(up_url, data=b64, method='POST')
-        req.add_header('Content-Type', 'image/jpeg')
-        urllib.request.urlopen(req, timeout=15)
-    except:
-        pass
-
-def emby_refresh():
-    if not EMBY_API_KEY:
-        return
-    try:
-        import urllib.request
-        url = f"{EMBY_HOST}/emby/Library/Refresh?api_key={EMBY_API_KEY}"
-        req = urllib.request.Request(url, method='POST', data=b'')
-        urllib.request.urlopen(req, timeout=10)
-        log.info("[Emby] 已触发刷新")
-    except:
-        pass
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  主流程
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -468,7 +410,6 @@ def process(number, output_dir, plex=False):
     dest = os.path.join(output_dir, number)
     os.makedirs(dest, exist_ok=True)
 
-    # 如果已存在完整数据就跳过
     nfo_path = os.path.join(dest, 'movie.nfo')
     poster_path = os.path.join(dest, 'poster.jpg')
     if os.path.exists(nfo_path) and os.path.exists(poster_path) and os.path.getsize(poster_path) > 5000:
@@ -492,11 +433,9 @@ def process(number, output_dir, plex=False):
     write_nfo(info, nfo_path)
     log.info(f"  ✓ movie.nfo")
 
-    # Plex: 额外生成 {番号}.nfo (Plex XBMCnfoImporter 按视频文件名匹配)
     if plex:
         plex_nfo = os.path.join(dest, f"{number}.nfo")
         if not os.path.exists(plex_nfo):
-            import shutil
             shutil.copy2(nfo_path, plex_nfo)
             log.info(f"  ✓ {number}.nfo (Plex)")
 
@@ -510,14 +449,12 @@ def process(number, output_dir, plex=False):
     else:
         log.warning(f"  ✗ poster.jpg 下载失败")
 
-    # 4. fanart (复制 poster)
-    import shutil
+    # 4. fanart
     fanart_path = os.path.join(dest, 'fanart.jpg')
     if os.path.exists(poster_path) and os.path.getsize(poster_path) > 5000:
         shutil.copy2(poster_path, fanart_path)
         log.info(f"  ✓ fanart.jpg")
 
-    # Plex: 额外生成 art.jpg + {番号}-poster.jpg
     if plex and os.path.exists(poster_path) and os.path.getsize(poster_path) > 5000:
         for extra in [f"{number}-poster.jpg", "art.jpg"]:
             ep = os.path.join(dest, extra)
@@ -531,12 +468,6 @@ def process(number, output_dir, plex=False):
         photo_path = os.path.join(dest, '.actors', f"{aname}.jpg")
         if download_actor_photo(aname, photo_path):
             log.info(f"  ✓ .actors/{aname}.jpg")
-            # 顺便上传到 Emby
-            try:
-                with open(photo_path, 'rb') as f:
-                    emby_upload_actor(aname, f.read())
-            except:
-                pass
         else:
             log.info(f"  ✗ .actors/{aname}.jpg (未找到)")
         time.sleep(0.3)
@@ -547,18 +478,16 @@ def process(number, output_dir, plex=False):
 def main():
     parser = argparse.ArgumentParser(
         description='AV 元数据刮削工具',
-        usage='jav -n JUL-999 [-o 输出目录]'
+        usage='python jav.py -n JUL-999 [-o 输出目录]'
     )
     parser.add_argument('-n', '--number', required=True, help='番号 (支持多个，空格分隔)', nargs='+')
     parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT, help=f'输出目录 (默认: {DEFAULT_OUTPUT})')
     parser.add_argument('--plex', action='store_true', help='同时生成 Plex 兼容文件')
-    parser.add_argument('--no-emby', action='store_true', help='不触发 Emby 刷新')
 
     args = parser.parse_args()
     output_dir = args.output
     os.makedirs(output_dir, exist_ok=True)
 
-    # 解析所有番号
     numbers = []
     for raw in args.number:
         for part in raw.replace(',', ' ').split():
@@ -595,9 +524,6 @@ def main():
     log.info(f"  完成: {success} 成功, {fail} 失败")
     log.info(f"  输出: {output_dir}")
     log.info(f"{'═'*50}")
-
-    if success > 0 and not args.no_emby:
-        emby_refresh()
 
 
 if __name__ == '__main__':
