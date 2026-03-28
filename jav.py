@@ -31,13 +31,46 @@ SCRAPE_DELAY = 2
 
 # ─── curl_cffi session (反爬虫) ───
 _session = None
+_proxy = None
+
+def set_proxy(proxy_url):
+    global _proxy
+    _proxy = proxy_url
+
+def _detect_proxy():
+    """检测系统代理设置"""
+    for env in ('https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY', 'ALL_PROXY', 'all_proxy'):
+        val = os.environ.get(env)
+        if val:
+            return val
+    # macOS: 尝试读取网络偏好的 web proxy
+    try:
+        import subprocess
+        r = subprocess.run(['networksetup', '-getwebproxy', 'Wi-Fi'],
+                          capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            if line.startswith('Enabled:') and 'Yes' in line:
+                server = port = None
+                for l2 in r.stdout.splitlines():
+                    if l2.startswith('Server:'): server = l2.split(':', 1)[1].strip()
+                    if l2.startswith('Port:'): port = l2.split(':', 1)[1].strip()
+                if server and port:
+                    return f"http://{server}:{port}"
+    except Exception:
+        pass
+    return None
+
 def get_session():
     global _session
     if _session is None:
         from curl_cffi import requests as cffi_requests
-        _session = cffi_requests.Session(impersonate="chrome136")
+        proxy = _proxy or _detect_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        _session = cffi_requests.Session(impersonate="chrome136", proxies=proxies)
         _session.cookies.set('over18', '1')
         _session.cookies.set('locale', 'zh')
+        if proxy:
+            log.info(f"  使用代理: {proxy}")
     return _session
 
 # ─── Gfriends 演员头像缓存 ───
@@ -407,7 +440,11 @@ def process(number, output_dir, plex=False):
     log.info(f"  {number}")
     log.info(f"{'─'*50}")
 
-    dest = os.path.join(output_dir, number)
+    # 如果输出目录名已经是番号，直接用，不再嵌套
+    if os.path.basename(os.path.normpath(output_dir)).upper() == number.upper():
+        dest = output_dir
+    else:
+        dest = os.path.join(output_dir, number)
     os.makedirs(dest, exist_ok=True)
 
     nfo_path = os.path.join(dest, 'movie.nfo')
@@ -483,8 +520,11 @@ def main():
     parser.add_argument('-n', '--number', required=True, help='番号 (支持多个，空格分隔)', nargs='+')
     parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT, help=f'输出目录 (默认: {DEFAULT_OUTPUT})')
     parser.add_argument('--plex', action='store_true', help='同时生成 Plex 兼容文件')
+    parser.add_argument('--proxy', help='HTTP 代理 (如 http://127.0.0.1:7890，不指定则自动检测系统代理)')
 
     args = parser.parse_args()
+    if args.proxy:
+        set_proxy(args.proxy)
     output_dir = args.output
     os.makedirs(output_dir, exist_ok=True)
 
